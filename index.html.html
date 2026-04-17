@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Audit Pro-Ration Calculator</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F2EFE9; min-height: 100vh; }
+    button { font-family: inherit; cursor: pointer; }
+    input { font-family: inherit; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    input[type="text"] {
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input[type="text"]:focus { border-color: #E8611A; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef } = React;
+
+    const ORANGE = "#E8611A";
+    const ORANGE_HOVER = "#D05516";
+    const GREEN = "#1A7A4A";
+
+    const SYSTEM_PROMPT = `You are an audit pro-ration calculation engine. You will receive policy documents and endorsements as text, plus an optional cancellation date. Extract all relevant data and perform pro-rated payroll calculations.
+
+OUTPUT FORMAT: Respond ONLY with a valid JSON object — no markdown, no preamble, no explanation outside the JSON.
+
+JSON structure:
+{
+  "insured_name": "string or null",
+  "policy_start": "MM/DD/YYYY",
+  "policy_end": "MM/DD/YYYY",
+  "cancellation_date": "MM/DD/YYYY or null",
+  "total_days": integer,
+  "class_codes": [
+    {
+      "code": "string",
+      "description": "string",
+      "state": "string",
+      "periods": [
+        {
+          "label": "Period 1",
+          "start": "MM/DD/YYYY",
+          "end": "MM/DD/YYYY",
+          "days": integer,
+          "fraction": "151/365",
+          "remuneration": number,
+          "contribution": number
+        }
+      ],
+      "pro_rated_total": integer
+    }
+  ],
+  "errors": []
+}
+
+PRO-RATION CALCULATION RULES — follow exactly:
+- Total policy days = end date minus start date (integer).
+- If cancellation date provided, effective policy end = cancellation date.
+- Endorsement effective date is the FIRST day of the new period.
+- Express fraction as "days/total_days" string.
+- For each class code: sum (remuneration_i x period_i_days / total_days) across all periods. NO intermediate rounding.
+- pro_rated_total = round to nearest whole dollar only at the end.
+- Chain multiple endorsements as Period 1, Period 2, Period 3, etc.
+- If a class code appears only in the policy (no endorsement change), it has one period covering the full effective policy period.
+- If a class code is added via endorsement mid-term, Period 1 starts on the endorsement effective date.
+- If a class code is removed via endorsement mid-term, its final period ends on the endorsement effective date.
+- state field: extract state abbreviation from document if available, otherwise empty string.`;
+
+    const readFile = (file) => new Promise((res, rej) => {
+      const r = new FileReader();
+      if (file.type === "application/pdf") {
+        r.onload = () => res({ type: "pdf", name: file.name, data: r.result.split(",")[1] });
+        r.onerror = rej;
+        r.readAsDataURL(file);
+      } else {
+        r.onload = () => res({ type: "text", name: file.name, data: new TextDecoder().decode(r.result) });
+        r.onerror = rej;
+        r.readAsArrayBuffer(file);
+      }
+    });
+
+    const Badge = ({ children, color }) => (
+      <span style={{
+        fontSize: 11, padding: "3px 10px", borderRadius: 999, fontWeight: 600,
+        background: color === GREEN ? "#EAF5F0" : "#FDF0E8",
+        color: color === GREEN ? GREEN : ORANGE,
+      }}>{children}</span>
+    );
+
+    const SectionLabel = ({ children, description }) => (
+      <div style={{ marginBottom: 14 }}>
+        <p style={{ margin: "0 0 3px", fontSize: 15, fontWeight: 600, color: "#1a1a1a" }}>{children}</p>
+        {description && <p style={{ margin: 0, fontSize: 12, color: "#666", lineHeight: 1.5 }}>{description}</p>}
+        <div style={{ marginTop: 10, height: 1.5, background: "#F2EFE9", borderRadius: 2 }} />
+      </div>
+    );
+
+    const CARD = {
+      background: "#FFFFFF",
+      borderRadius: 16,
+      border: "1px solid #e8e4de",
+      padding: "20px 22px",
+      boxShadow: "0 1px 3px rgba(0,0,0,0.07)",
+    };
+
+    const dropZoneStyle = (active) => ({
+      border: `1.5px dashed ${active ? ORANGE : "#ccc"}`,
+      borderRadius: 12,
+      padding: "18px 16px",
+      textAlign: "center",
+      cursor: "pointer",
+      background: active ? "#FDF0E8" : "#F9F8F6",
+      transition: "border-color 0.15s, background 0.15s",
+    });
+
+    function App() {
+      const [view, setView] = useState("form");
+      const [policyFile, setPolicyFile] = useState(null);
+      const [endorsements, setEndorsements] = useState([]);
+      const [cancelDate, setCancelDate] = useState("");
+      const [results, setResults] = useState(null);
+      const [error, setError] = useState("");
+      const [detailsOpen, setDetailsOpen] = useState(false);
+      const [dragOver, setDragOver] = useState(null);
+      const policyRef = useRef();
+      const endRef = useRef();
+
+      const handlePolicyFile = (e) => { if (e.target.files[0]) setPolicyFile(e.target.files[0]); e.target.value = ""; };
+      const handleEndFiles = (e) => { setEndorsements(p => [...p, ...Array.from(e.target.files)]); e.target.value = ""; };
+      const removeEnd = (i) => setEndorsements(p => p.filter((_, idx) => idx !== i));
+
+      const handleDrop = (e, type) => {
+        e.preventDefault(); setDragOver(null);
+        const files = Array.from(e.dataTransfer.files);
+        if (type === "policy" && files[0]) setPolicyFile(files[0]);
+        if (type === "end") setEndorsements(p => [...p, ...files]);
+      };
+
+      const calculate = async () => {
+        if (!policyFile) { setError("Please upload a Policy Output file."); return; }
+        setError(""); setView("loading");
+        try {
+          const pf = await readFile(policyFile);
+          const ef = await Promise.all(endorsements.map(readFile));
+
+          const toBlock = (f, label) => f.type === "pdf"
+            ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: f.data }, title: label }
+            : { type: "text", text: `${label}:\n${f.data}` };
+
+          const content = [
+            toBlock(pf, `POLICY OUTPUT (${policyFile.name})`),
+            ...ef.map((f, i) => toBlock(f, `ENDORSEMENT ${i + 1} (${endorsements[i].name})`)),
+            ...(cancelDate ? [{ type: "text", text: `CANCELLATION DATE: ${cancelDate}` }] : []),
+            { type: "text", text: "Extract all data and return the JSON result as specified." },
+          ];
+
+          const res = await fetch("/api/calculate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 4000, system: SYSTEM_PROMPT, messages: [{ role: "user", content }] }),
+          });
+          const data = await res.json();
+          if (data.error) throw new Error(`API error: ${data.error.type} — ${data.error.message}`);
+          if (!data.content?.length) throw new Error(`Empty response: ${JSON.stringify(data).slice(0, 300)}`);
+
+          const raw = data.content.map(b => b.text || "").join("");
+          const clean = raw.replace(/```json|```/g, "").trim();
+          let parsed;
+          try { parsed = JSON.parse(clean); }
+          catch {
+            const match = clean.match(/\{[\s\S]*/);
+            if (match) parsed = JSON.parse(match[0].replace(/,\s*$/, "") + (match[0].split("{").length > match[0].split("}").length ? "}" : ""));
+            else throw new Error("Could not parse response.");
+          }
+          setResults(parsed); setView("results");
+        } catch (e) {
+          setError("Error processing documents: " + e.message); setView("form");
+        }
+      };
+
+      const reset = () => { setView("form"); setResults(null); setPolicyFile(null); setEndorsements([]); setCancelDate(""); setError(""); setDetailsOpen(false); };
+
+      const fmt = (n) => "$" + Number(n).toLocaleString();
+
+      const Header = () => (
+        <div style={{ padding: "20px 28px 16px", background: "#fff", borderBottom: `3px solid ${ORANGE}` }}>
+          <p style={{ margin: 0, fontSize: 22, fontWeight: 600, color: "#1a1a1a" }}>
+            <span style={{ color: ORANGE }}>Audit</span> Pro-Ration Calculator
+          </p>
+          <p style={{ margin: "3px 0 0", fontSize: 13, color: "#666" }}>
+            Upload your policy output, endorsements, and cancellation date — then calculate.
+          </p>
+        </div>
+      );
+
+      if (view === "loading") return (
+        <div style={{ maxWidth: 680, margin: "40px auto", borderRadius: 20, overflow: "hidden", boxShadow: "0 4px 24px rgba(0,0,0,0.08)" }}>
+          <Header />
+          <div style={{ background: "#F2EFE9", minHeight: 420, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16 }}>
+            <div style={{ width: 36, height: 36, border: "3px solid #E8D5C4", borderTop: `3px solid ${ORANGE}`, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+            <p style={{ color: "#666", fontSize: 14 }}>Calculating pro-rated totals…</p>
+          </div>
+        </div>
+      );
+
+      if (view === "results" && results) return (
+        <div style={{ maxWidth: 680, margin: "40px auto", borderRadius: 20, overflow: "hidden", boxShadow: "0 4px 24px rgba(0,0,0,0.08)" }}>
+          <Header />
+          <div style={{ background: "#F2EFE9", padding: "28px 28px 32px" }}>
+            <div style={CARD}>
+              <p style={{ margin: "0 0 4px", fontSize: 17, fontWeight: 600, color: "#1a1a1a" }}>Pro-Rated Results</p>
+              <p style={{ margin: "0 0 20px", fontSize: 13, color: "#666" }}>
+                {results.insured_name && <><strong style={{ color: "#1a1a1a" }}>{results.insured_name}</strong> — </>}
+                {results.policy_start} to {results.cancellation_date || results.policy_end} · {results.total_days} days
+                {results.cancellation_date && (
+                  <span style={{ marginLeft: 8, fontSize: 11, padding: "2px 8px", background: "#FDE8E8", color: "#A32D2D", borderRadius: 999, fontWeight: 600 }}>
+                    Cancelled {results.cancellation_date}
+                  </span>
+                )}
+              </p>
+
+              <div style={{ border: "1px solid #e8e4de", borderRadius: 12, overflow: "hidden" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ background: "#F2EFE9" }}>
+                      {["Code", "Description", "State", "Pro-Rated Total"].map((h, i) => (
+                        <th key={h} style={{ textAlign: i === 3 ? "right" : "left", padding: "9px 14px", fontWeight: 600, fontSize: 11, color: "#666", letterSpacing: "0.05em", borderBottom: "1px solid #e8e4de" }}>{h.toUpperCase()}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.class_codes?.map((cc, i) => (
+                      <tr key={i} style={{ borderBottom: "1px solid #e8e4de", background: i % 2 === 1 ? "#fafaf9" : "#fff" }}>
+                        <td style={{ padding: "11px 14px", fontWeight: 600, fontSize: 13 }}>{cc.code}</td>
+                        <td style={{ padding: "11px 14px", color: "#555", fontSize: 13 }}>{cc.description}</td>
+                        <td style={{ padding: "11px 14px", color: "#555", fontSize: 13 }}>{cc.state}</td>
+                        <td style={{ padding: "11px 14px", textAlign: "right", fontWeight: 600, color: GREEN, fontSize: 14 }}>{fmt(cc.pro_rated_total)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div style={{ marginTop: 16, border: "1px solid #e8e4de", borderRadius: 12, overflow: "hidden" }}>
+                <button
+                  onClick={() => setDetailsOpen(o => !o)}
+                  style={{ width: "100%", textAlign: "left", padding: "11px 14px", background: "#F2EFE9", border: "none", fontSize: 13, display: "flex", alignItems: "center", gap: 8, color: "#555" }}
+                >
+                  <span style={{ fontSize: 10 }}>{detailsOpen ? "▼" : "▶"}</span> Calculation Details
+                </button>
+                {detailsOpen && (
+                  <div style={{ padding: "16px 14px", borderTop: "1px solid #e8e4de", display: "flex", flexDirection: "column", gap: 20 }}>
+                    {results.class_codes?.map((cc, i) => (
+                      <div key={i}>
+                        <p style={{ margin: "0 0 8px", fontWeight: 600, fontSize: 13 }}>{cc.code} — {cc.description}{cc.state ? ` (${cc.state})` : ""}</p>
+                        <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse", border: "1px solid #e8e4de", borderRadius: 10, overflow: "hidden" }}>
+                          <thead>
+                            <tr style={{ background: "#F2EFE9" }}>
+                              {["Period", "Dates", "Days", "Fraction", "Remuneration", "Contribution"].map(h => (
+                                <th key={h} style={{ textAlign: "left", padding: "6px 10px", color: "#666", fontWeight: 600, fontSize: 11, borderBottom: "1px solid #e8e4de" }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {cc.periods?.map((p, j) => (
+                              <tr key={j} style={{ borderTop: "1px solid #e8e4de", background: j % 2 === 1 ? "#fafaf9" : "#fff" }}>
+                                <td style={{ padding: "6px 10px" }}>{p.label}</td>
+                                <td style={{ padding: "6px 10px", color: "#555" }}>{p.start} – {p.end}</td>
+                                <td style={{ padding: "6px 10px" }}>{p.days}</td>
+                                <td style={{ padding: "6px 10px" }}>{p.fraction}</td>
+                                <td style={{ padding: "6px 10px" }}>{fmt(p.remuneration)}</td>
+                                <td style={{ padding: "6px 10px" }}>{fmt(p.contribution)}</td>
+                              </tr>
+                            ))}
+                            <tr style={{ borderTop: "1px solid #e8e4de", background: "#F2EFE9" }}>
+                              <td colSpan={5} style={{ padding: "6px 10px", textAlign: "right", color: "#666", fontSize: 11, fontWeight: 600 }}>PRO-RATED TOTAL</td>
+                              <td style={{ padding: "6px 10px", color: GREEN, fontWeight: 600 }}>{fmt(cc.pro_rated_total)}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <button
+              onClick={reset}
+              style={{ marginTop: 16, width: "100%", padding: 14, background: ORANGE, color: "#fff", border: "none", borderRadius: 12, fontSize: 14, fontWeight: 600 }}
+              onMouseOver={e => e.currentTarget.style.background = ORANGE_HOVER}
+              onMouseOut={e => e.currentTarget.style.background = ORANGE}
+            >
+              Start New Calculation
+            </button>
+          </div>
+        </div>
+      );
+
+      return (
+        <div style={{ maxWidth: 680, margin: "40px auto", borderRadius: 20, overflow: "hidden", boxShadow: "0 4px 24px rgba(0,0,0,0.08)" }}>
+          <Header />
+          <div style={{ background: "#F2EFE9", padding: "28px 28px 32px", display: "flex", flexDirection: "column", gap: 20 }}>
+
+            {/* Policy Output */}
+            <div style={CARD}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <SectionLabel description="The original policy document containing estimated payroll by class code at policy inception.">Policy Output</SectionLabel>
+                <div style={{ marginLeft: 12, flexShrink: 0 }}>{policyFile ? <Badge color={ORANGE}>Uploaded</Badge> : <Badge color={ORANGE}>Required</Badge>}</div>
+              </div>
+              {policyFile ? (
+                <div style={{ background: "#EAF5F0", border: "1px solid #A8D5BE", borderRadius: 10, padding: "12px 16px", display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ color: GREEN }}>📄</span>
+                  <span style={{ fontSize: 13, color: GREEN, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{policyFile.name}</span>
+                  <span onClick={() => setPolicyFile(null)} style={{ cursor: "pointer", color: GREEN, fontSize: 12, whiteSpace: "nowrap" }}>Remove</span>
+                </div>
+              ) : (
+                <div
+                  onClick={() => policyRef.current.click()}
+                  onDrop={e => handleDrop(e, "policy")}
+                  onDragOver={e => { e.preventDefault(); setDragOver("policy"); }}
+                  onDragLeave={() => setDragOver(null)}
+                  style={dropZoneStyle(dragOver === "policy")}
+                >
+                  <p style={{ margin: "0 0 2px", fontSize: 13, color: "#555" }}>Click or drag & drop your Policy Output</p>
+                  <p style={{ margin: 0, fontSize: 12, color: "#999" }}>PDF, TXT, or CSV</p>
+                </div>
+              )}
+              <input ref={policyRef} type="file" accept=".pdf,.txt,.csv" onChange={handlePolicyFile} style={{ display: "none" }} />
+            </div>
+
+            {/* Endorsements */}
+            <div style={CARD}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <SectionLabel description="Midterm endorsements that change estimated payroll — including remuneration updates, added or removed class codes, and location changes. Non-payroll endorsements can be ignored.">Endorsements</SectionLabel>
+                <div style={{ marginLeft: 12, flexShrink: 0 }}>{endorsements.length > 0 ? <Badge color={ORANGE}>{endorsements.length} file{endorsements.length > 1 ? "s" : ""}</Badge> : <Badge color={GREEN}>Optional</Badge>}</div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {endorsements.map((f, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fafaf9", border: "1px solid #e8e4de", borderRadius: 10, padding: "9px 12px" }}>
+                    <span style={{ width: 22, height: 22, background: ORANGE, color: "#fff", borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 600, flexShrink: 0 }}>{i + 1}</span>
+                    <span style={{ fontSize: 13, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+                    <span onClick={() => removeEnd(i)} style={{ cursor: "pointer", color: "#aaa", fontSize: 18, lineHeight: 1 }}>×</span>
+                  </div>
+                ))}
+                <div
+                  onClick={() => { endRef.current.value = ""; endRef.current.click(); }}
+                  onDrop={e => handleDrop(e, "end")}
+                  onDragOver={e => { e.preventDefault(); setDragOver("end"); }}
+                  onDragLeave={() => setDragOver(null)}
+                  style={dropZoneStyle(dragOver === "end")}
+                >
+                  <p style={{ margin: "0 0 2px", fontSize: 13, color: "#555" }}>{endorsements.length > 0 ? "Add more endorsements" : "Click or drag & drop endorsements"}</p>
+                  <p style={{ margin: 0, fontSize: 12, color: "#999" }}>Supports multiple files · PDF, TXT, or CSV</p>
+                </div>
+              </div>
+              <input ref={endRef} type="file" accept=".pdf,.txt,.csv" multiple onChange={handleEndFiles} style={{ display: "none" }} />
+            </div>
+
+            {/* Cancellation Date */}
+            <div style={CARD}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <SectionLabel description="If the policy was cancelled mid-term, enter the cancellation date to pro-rate accordingly.">Cancellation Date</SectionLabel>
+                <div style={{ marginLeft: 12, flexShrink: 0 }}><Badge color={GREEN}>Optional</Badge></div>
+              </div>
+              <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 600, letterSpacing: "0.06em", color: "#888" }}>POLICY CANCELLATION DATE</p>
+              <input
+                type="text"
+                placeholder="MM/DD/YYYY"
+                value={cancelDate}
+                onChange={e => setCancelDate(e.target.value)}
+                style={{ width: 180 }}
+              />
+              <p style={{ margin: "8px 0 0", fontSize: 12, color: "#999" }}>Leave blank if no cancellation applies.</p>
+            </div>
+
+            {error && (
+              <div style={{ background: "#FDE8E8", border: "1px solid #F09595", borderRadius: 12, padding: "10px 14px" }}>
+                <p style={{ margin: 0, fontSize: 13, color: "#A32D2D" }}>{error}</p>
+              </div>
+            )}
+
+            <button
+              onClick={calculate}
+              style={{ width: "100%", padding: 14, background: ORANGE, color: "#fff", border: "none", borderRadius: 12, fontSize: 14, fontWeight: 600 }}
+              onMouseOver={e => e.currentTarget.style.background = ORANGE_HOVER}
+              onMouseOut={e => e.currentTarget.style.background = ORANGE}
+            >
+              Calculate Pro-Rated Totals
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
